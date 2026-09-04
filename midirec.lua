@@ -8,6 +8,7 @@
 -- E3 loop on / off
 --
 -- params: in/out port, loop,
+-- rec on first note,
 -- echo rec / standby / play
 
 local recfile = include("midirec/lib/recfile")
@@ -17,7 +18,9 @@ local DATA_DIR = _path.data .. "midirec/"
 local midi_in
 local midi_out
 
-local state = "stop" -- "stop" | "rec" | "play"
+local state = "stop" -- "stop" | "arm" | "rec" | "play"
+-- "arm": record pressed with "rec on note" on. nothing is timed or stored
+-- until the first note-on arrives; that note becomes t = 0.
 
 local events = {}    -- {t = seconds, data = {bytes...}}
 local len = 0        -- take length in seconds
@@ -31,8 +34,15 @@ local screen_metro
 local takes = {}     -- list of filenames in DATA_DIR
 local take_sel = 1
 local dirty = false  -- unsaved recording
+local rec_name       -- filename the current recording will save as
+local loaded         -- index in takes of the take held in events, if any
+local queued         -- take index to switch to when the current pass ends
+local read_take      -- forward decl, defined under files
 
-local notes_on = {}  -- [ch][note] = true, for panic on stop
+-- held notes per source, [src][ch][note] = true. "play" is the take,
+-- "echo" is live input passed through. tracked separately so the loop-wrap
+-- panic releases only playback notes and leaves a held echo note alone.
+local notes_on = {play = {}, echo = {}}
 local last_out = -1  -- util.time() of last outgoing message
 
 -- helpers -------------------------------------------------------------
@@ -70,7 +80,7 @@ end
 -- no error. so dispatch by message type instead of sending bytes: that path
 -- works for real hardware ports too, since norns' own Midi:note_on and
 -- friends just build a message and call :send() internally.
-local function send(data)
+local function send(data, src)
   if midi_out then
     local m = midi.to_msg(data)
     local t = m and m.type
@@ -103,27 +113,34 @@ local function send(data)
   last_out = util.time()
   local msg = midi.to_msg(data)
   if msg.ch then
+    local held = notes_on[src]
     if msg.type == "note_on" and msg.vel > 0 then
-      notes_on[msg.ch] = notes_on[msg.ch] or {}
-      notes_on[msg.ch][msg.note] = true
+      held[msg.ch] = held[msg.ch] or {}
+      held[msg.ch][msg.note] = true
     elseif msg.type == "note_off" or (msg.type == "note_on" and msg.vel == 0) then
-      if notes_on[msg.ch] then notes_on[msg.ch][msg.note] = nil end
+      if held[msg.ch] then held[msg.ch][msg.note] = nil end
     end
   end
 end
 
-local function all_notes_off()
-  for ch, notes in pairs(notes_on) do
-    for note, _ in pairs(notes) do
-      if midi_out then midi_out:note_off(note, 0, ch) end
+-- release held notes for one source, or every source when src is nil
+local function all_notes_off(src)
+  local srcs = src and {src} or {"play", "echo"}
+  for _, s in ipairs(srcs) do
+    for ch, notes in pairs(notes_on[s]) do
+      for note, _ in pairs(notes) do
+        if midi_out then midi_out:note_off(note, 0, ch) end
+      end
     end
+    notes_on[s] = {}
   end
-  notes_on = {}
 end
 
 -- transport -----------------------------------------------------------
 
 local function stop()
+  local pending = queued
+  queued = nil
   if play_clock then
     clock.cancel(play_clock)
     play_clock = nil
@@ -131,9 +148,16 @@ local function stop()
   if state == "rec" then
     len = util.time() - rec_start
     dirty = #events > 0
+  elseif state == "arm" then
+    len = 0
+    dirty = false
   end
-  all_notes_off()
+  -- only the take's notes. a note held on the live input keeps sounding
+  -- until the player lets go of it.
+  all_notes_off("play")
   state = "stop"
+  -- stopped with a take queued: load it now so the header and events agree
+  if pending then read_take(pending) end
 end
 
 local function start_rec()
@@ -142,7 +166,9 @@ local function start_rec()
   len = 0
   play_pos = 0
   rec_start = util.time()
-  state = "rec"
+  rec_name = next_take_name()
+  loaded = nil
+  state = params:get("rec_on_note") == 2 and "arm" or "rec"
 end
 
 local function seek(pos)
@@ -165,18 +191,33 @@ local function start_play()
       clock.sleep(1 / 200)
       play_pos = util.time() - t0
       while play_idx <= #events and events[play_idx].t <= play_pos do
-        send(events[play_idx].data)
+        send(events[play_idx].data, "play")
         play_idx = play_idx + 1
       end
       if play_pos >= len then
-        if params:get("loop") == 2 then
-          all_notes_off()
+        if queued then
+          -- E1 turned during play: switch takes here, at the pass boundary,
+          -- whether or not loop is on. an empty or unreadable take stops.
+          local q = queued
+          queued = nil
+          all_notes_off("play")
+          if read_take(q) and #events > 0 then
+            play_pos = 0
+            play_idx = 1
+            t0 = util.time()
+          else
+            state = "stop"
+            play_clock = nil
+            return
+          end
+        elseif params:get("loop") == 2 then
+          all_notes_off("play")
           play_pos = 0
           play_idx = 1
           t0 = util.time()
         else
           play_pos = len
-          all_notes_off()
+          all_notes_off("play")
           state = "stop"
           play_clock = nil
           return
@@ -196,7 +237,7 @@ local function save_take()
     dirty = false
     scan_takes()
     for i, v in ipairs(takes) do
-      if v == name then take_sel = i end
+      if v == name then take_sel = i; loaded = i end
     end
     print("midirec: saved " .. name)
   else
@@ -204,9 +245,9 @@ local function save_take()
   end
 end
 
-local function load_take(i)
-  if not takes[i] then return end
-  stop()
+-- read take i into events without touching transport. returns true on success.
+read_take = function(i)
+  if not takes[i] then return false end
   local e, l = recfile.read(DATA_DIR .. takes[i])
   if e then
     events = e
@@ -214,17 +255,25 @@ local function load_take(i)
     play_pos = 0
     play_idx = 1
     dirty = false
+    loaded = i
     print("midirec: loaded " .. takes[i] .. " (" .. #events .. " events)")
-  else
-    print("midirec: load failed - " .. tostring(l))
+    return true
   end
+  print("midirec: load failed - " .. tostring(l))
+  return false
+end
+
+local function load_take(i)
+  if not takes[i] then return end
+  stop()
+  read_take(i)
 end
 
 -- midi input ----------------------------------------------------------
 
 local function midi_event(data)
   local echo
-  if state == "rec" then
+  if state == "rec" or state == "arm" then
     echo = params:get("echo_rec") == 2
   elseif state == "stop" then
     echo = params:get("echo_standby") == 2
@@ -233,7 +282,15 @@ local function midi_event(data)
   else
     echo = false
   end
-  if echo then send(data) end
+  if echo then send(data, "echo") end
+  if state == "arm" then
+    -- first note-on starts the clock. anything before it is dropped.
+    local msg = midi.to_msg(data)
+    if msg.type == "note_on" and msg.vel > 0 then
+      rec_start = util.time()
+      state = "rec"
+    end
+  end
   if state == "rec" then
     local t = util.time() - rec_start
     local copy = {}
@@ -271,13 +328,11 @@ function init()
   end)
 
   params:add_option("loop", "loop", {"off", "on"}, 1)
+  params:add_option("rec_on_note", "rec on first note", {"off", "on"}, 1)
 
   params:add_option("echo_rec", "echo rec", {"off", "on"}, 2)
   params:add_option("echo_standby", "echo standby", {"off", "on"}, 2)
-  -- default off: playing along shares the notes_on table with playback, so
-  -- a note still held when the take ends or loops gets released by the
-  -- panic in all_notes_off(). see the comment there.
-  params:add_option("echo_play", "echo play", {"off", "on"}, 1)
+  params:add_option("echo_play", "echo play", {"off", "on"}, 2)
 
   params:add_trigger("save", "save take")
   params:set_action("save", function() save_take() end)
@@ -292,6 +347,7 @@ end
 
 function cleanup()
   stop()
+  all_notes_off()
   if screen_metro then screen_metro:stop() end
   if midi_in then midi_in.event = nil end
 end
@@ -303,14 +359,14 @@ function key(n, z)
   if n == 2 then
     if state == "play" then
       stop()
-    elseif state == "rec" then
+    elseif state == "rec" or state == "arm" then
       stop()
       save_take()
     else
       start_play()
     end
   elseif n == 3 then
-    if state == "rec" then
+    if state == "rec" or state == "arm" then
       stop()
       save_take()
     else
@@ -326,11 +382,17 @@ function enc(n, d)
       local new = util.clamp(take_sel + d, 1, #takes)
       if new ~= take_sel then
         take_sel = new
-        load_take(take_sel)
+        if state == "play" then
+          -- don't interrupt: queue it for the end of this pass. turning
+          -- back to the playing take cancels the queue.
+          queued = new ~= loaded and new or nil
+        else
+          load_take(take_sel)
+        end
       end
     end
   elseif n == 2 then
-    if state ~= "rec" and len > 0 then
+    if state ~= "rec" and state ~= "arm" and len > 0 then
       seek(play_pos + d * (len / 100))
     end
   elseif n == 3 then
@@ -349,17 +411,25 @@ function redraw()
   screen.move(0, 8)
   screen.text("midirec")
 
-  -- take name
-  screen.level(#takes > 0 and 15 or 3)
+  -- take name. while recording, show the take this will be saved as, so
+  -- the header does not lag behind until the recording stops.
+  local shown = (state == "rec" or state == "arm") and rec_name
+    or takes[take_sel]
+  screen.level(shown and 15 or 3)
   screen.move(128, 8)
-  screen.text_right(takes[take_sel] and takes[take_sel]:gsub("%.mrec$", "")
-    or "-")
+  shown = shown and shown:gsub("%.mrec$", "") or "-"
+  screen.text_right(queued and ("next: " .. shown) or shown)
 
   -- transport
   screen.level(15)
   screen.move(0, 30)
   if state == "rec" then
     screen.text("● REC")
+  elseif state == "arm" then
+    -- waiting for the first note. blink so it reads as live, not stuck.
+    screen.level(math.floor(util.time() * 2) % 2 == 0 and 15 or 6)
+    screen.text("● ARM")
+    screen.level(15)
   elseif state == "play" then
     screen.text("▶ PLAY")
     -- out activity: bright on send, fades over ~150ms
@@ -382,6 +452,8 @@ function redraw()
   screen.move(128, 30)
   if state == "rec" then
     screen.text_right(fmt_time(util.time() - rec_start))
+  elseif state == "arm" then
+    screen.text_right(fmt_time(0))
   else
     screen.text_right(fmt_time(play_pos) .. " / " .. fmt_time(len))
   end
