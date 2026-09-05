@@ -460,7 +460,9 @@ local function grid_redraw()
       for x = 1, cols do
         local note = grid_note(x, y)
         if note then
-          local lvl = keys_held[note] and 15 or (note % 12 == root and 8 or 2)
+          -- roots at 6: a hint on varibright, dark on monobright so the
+          -- keyboard shows only held notes there
+          local lvl = keys_held[note] and 15 or (note % 12 == root and 6 or 2)
           g:led(x, y, lvl)
         end
       end
