@@ -734,7 +734,8 @@ function redraw()
   screen.move(0, 18)
   screen.text(scale_label())
   screen.move(128, 18)
-  screen.text_right(string.format("%d %s", clock.get_tempo() + 0.5,
+  -- %d needs an integer in lua 5.3; a float here blanks the whole screen
+  screen.text_right(string.format("%d %s", math.floor(clock.get_tempo() + 0.5),
     params:string("clock_source")))
 
   -- take name. while recording, show the take this will be saved as, so
