@@ -9,8 +9,14 @@
 -- grid: takes, or keyboard.
 -- bottom row: scale ... stop, rec, -, menu
 --
+-- time is in beats from the norns
+-- clock (PARAMETERS > CLOCK sets
+-- source + tempo). 4/4 assumed.
+--
 -- params: in/out port, loop,
 -- rec on first note,
+-- length / launch quantize,
+-- follow transport,
 -- echo rec / standby / play,
 -- grid channel / velocity / base / scale
 
@@ -37,13 +43,21 @@ local state = "stop" -- "stop" | "arm" | "rec" | "play"
 -- "arm": record pressed with "rec on note" on. nothing is timed or stored
 -- until the first note-on arrives; that note becomes t = 0.
 
-local events = {}    -- {t = seconds, data = {bytes...}}
-local len = 0        -- take length in seconds
+-- all time is in beats on the norns global clock (clock.get_beats()), which
+-- follows whatever source PARAMETERS > CLOCK selects: internal, midi in,
+-- link, crow. so takes follow tempo changes and lock to an external clock
+-- without any clock parsing here.
+local BEATS_PER_BAR = 4   -- 4/4 assumed for now
 
-local rec_start = 0
-local play_pos = 0
+local events = {}    -- {t = beats from take start, data = {bytes...}}
+local len = 0        -- take length in beats
+
+local rec_start = 0  -- beat the current recording started (may be snapped)
+local play_pos = 0   -- beats into the take
+local play_t0 = 0    -- global beat that maps to take beat 0 while playing
 local play_idx = 1
 local play_clock
+local launch_pending = false -- play pressed, waiting for the quantize boundary
 local screen_metro
 
 local takes = {}     -- list of filenames in DATA_DIR
@@ -62,9 +76,29 @@ local last_out = -1  -- util.time() of last outgoing message
 
 -- helpers -------------------------------------------------------------
 
-local function fmt_time(s)
-  s = math.max(0, s)
-  return string.format("%d:%05.2f", math.floor(s / 60), s % 60)
+-- "bar.beat", 1-based, like a sequencer readout
+local function fmt_pos(b)
+  b = math.max(0, b)
+  return string.format("%d.%d",
+    math.floor(b / BEATS_PER_BAR) + 1, math.floor(b % BEATS_PER_BAR) + 1)
+end
+
+-- length in bars, decimals only when needed: "4b", "2.5b"
+local function fmt_len(b)
+  return string.format("%g", math.max(0, b) / BEATS_PER_BAR) .. "b"
+end
+
+-- quantize option (1 off, 2 beat, 3 bar) -> beats, or nil for off
+local function quant(param)
+  local v = params:get(param)
+  if v == 2 then return 1 end
+  if v == 3 then return BEATS_PER_BAR end
+  return nil
+end
+
+local function round_to(b, q)
+  if not q then return b end
+  return math.floor(b / q + 0.5) * q
 end
 
 local function scan_takes()
@@ -156,12 +190,24 @@ end
 local function stop()
   local pending = queued
   queued = nil
+  launch_pending = false
   if play_clock then
     clock.cancel(play_clock)
     play_clock = nil
   end
   if state == "rec" then
-    len = util.time() - rec_start
+    local raw = math.max(0, clock.get_beats() - rec_start)
+    -- length quantize rounds to the nearest beat/bar, min one unit, so a
+    -- stop pressed a hair late does not add a whole extra bar. events past
+    -- the new end are the tail of that overshoot; drop them. the loop-wrap
+    -- panic covers any note-off that went with them.
+    local q = quant("len_quant")
+    len = q and math.max(q, round_to(raw, q)) or raw
+    if q then
+      while #events > 0 and events[#events].t >= len do
+        events[#events] = nil
+      end
+    end
     dirty = #events > 0
   elseif state == "arm" then
     len = 0
@@ -180,7 +226,10 @@ local function start_rec()
   events = {}
   len = 0
   play_pos = 0
-  rec_start = util.time()
+  -- snap the start to the nearest launch-quantize boundary. pressed just
+  -- after a downbeat the take starts on that downbeat; pressed just before,
+  -- anything played early lands at t = 0.
+  rec_start = round_to(clock.get_beats(), quant("launch_quant"))
   rec_name = next_take_name()
   loaded = nil
   state = params:get("rec_on_note") == 2 and "arm" or "rec"
@@ -192,34 +241,49 @@ local function seek(pos)
   while play_idx <= #events and events[play_idx].t < play_pos do
     play_idx = play_idx + 1
   end
+  if state == "play" then play_t0 = clock.get_beats() - play_pos end
 end
 
-local function start_play()
+-- immediate skips launch quantize (transport start from an external clock
+-- is already on the boundary)
+local function start_play(immediate)
   if #events == 0 then return end
   stop()
   if play_pos >= len then play_pos = 0 end
   seek(play_pos)
   state = "play"
   play_clock = clock.run(function()
-    local t0 = util.time() - play_pos
+    local q = (not immediate) and quant("launch_quant")
+    if q then
+      -- clock.sync waits for the next multiple of q on the global beat
+      -- grid, so every take launches on the same grid
+      launch_pending = true
+      clock.sync(q)
+      launch_pending = false
+    end
+    play_t0 = clock.get_beats() - play_pos
     while true do
       clock.sleep(1 / 200)
-      play_pos = util.time() - t0
+      play_pos = clock.get_beats() - play_t0
       while play_idx <= #events and events[play_idx].t <= play_pos do
         send(events[play_idx].data, "play")
         play_idx = play_idx + 1
       end
       if play_pos >= len then
+        -- wrap by advancing the origin by exactly len rather than resetting
+        -- to "now", so the few ms this poll overshot do not accumulate and
+        -- the take stays locked to the beat grid pass after pass
         if queued then
           -- E1 turned during play: switch takes here, at the pass boundary,
           -- whether or not loop is on. an empty or unreadable take stops.
           local q = queued
           queued = nil
           all_notes_off("play")
+          local old_len = len
           if read_take(q) and #events > 0 then
-            play_pos = 0
+            play_t0 = play_t0 + old_len
+            play_pos = clock.get_beats() - play_t0
             play_idx = 1
-            t0 = util.time()
           else
             state = "stop"
             play_clock = nil
@@ -227,9 +291,9 @@ local function start_play()
           end
         elseif params:get("loop") == 2 then
           all_notes_off("play")
-          play_pos = 0
+          play_t0 = play_t0 + len
+          play_pos = clock.get_beats() - play_t0
           play_idx = 1
-          t0 = util.time()
         else
           play_pos = len
           all_notes_off("play")
@@ -247,7 +311,8 @@ end
 local function save_take()
   if #events == 0 then return end
   local name = next_take_name()
-  local ok, err = recfile.write(DATA_DIR .. name, events, len)
+  local ok, err = recfile.write(DATA_DIR .. name, events, len,
+    clock.get_tempo())
   if ok then
     dirty = false
     scan_takes()
@@ -325,15 +390,23 @@ end
 -- store a message into the take if recording. the first note-on while
 -- armed starts the clock; anything before it is dropped.
 local function record(data)
+  -- realtime bytes (clock ticks, start/stop, active sensing) never go in a
+  -- take. a clock-sending input would otherwise fill it with 0xF8s that
+  -- get re-sent on playback.
+  if data[1] >= 0xF8 then return end
   if state == "arm" then
     local msg = midi.to_msg(data)
     if msg.type == "note_on" and msg.vel > 0 then
-      rec_start = util.time()
+      -- the first note is t = 0. with launch quantize on, snap the start to
+      -- the nearest beat so the take sits on the grid; the note itself lands
+      -- at 0 if it was early, or a hair after 0 if late.
+      local b = clock.get_beats()
+      rec_start = quant("launch_quant") and round_to(b, 1) or b
       state = "rec"
     end
   end
   if state == "rec" then
-    local t = util.time() - rec_start
+    local t = math.max(0, clock.get_beats() - rec_start)
     local copy = {}
     for i = 1, #data do copy[i] = data[i] end
     events[#events + 1] = {t = t, data = copy}
@@ -552,6 +625,14 @@ function init()
   params:add_option("loop", "loop", {"off", "on"}, 1)
   params:add_option("rec_on_note", "rec on first note", {"off", "on"}, 1)
 
+  params:add_separator("time")
+  local QUANT = {"off", "beat", "bar"}
+  params:add_option("len_quant", "length quantize", QUANT, 3)
+  params:add_option("launch_quant", "launch quantize", QUANT, 3)
+  -- with an external clock source, its start plays the loaded take from 0
+  -- and its stop stops playback
+  params:add_option("follow", "follow transport", {"off", "on"}, 2)
+
   params:add_separator("grid keyboard")
   params:add_number("grid_ch", "grid channel", 1, 16, 1)
   params:add_number("grid_vel", "grid velocity", 1, 127, 100)
@@ -573,6 +654,18 @@ function init()
 
   params:bang()
 
+  -- external transport (midi / link start & stop). norns resets its beat
+  -- count on start, so playing from 0 right now is on the grid already.
+  clock.transport.start = function()
+    if params:get("follow") == 2 and state == "stop" and #events > 0 then
+      play_pos = 0
+      start_play(true)
+    end
+  end
+  clock.transport.stop = function()
+    if params:get("follow") == 2 and state == "play" then stop() end
+  end
+
   g = grid.connect()
   g.key = grid_key
   build_scale()
@@ -587,6 +680,8 @@ end
 function cleanup()
   stop()
   all_notes_off()
+  clock.transport.start = nil
+  clock.transport.stop = nil
   if screen_metro then screen_metro:stop() end
   if g then
     g.key = nil
@@ -616,7 +711,7 @@ function enc(n, d)
     end
   elseif n == 2 then
     if state ~= "rec" and state ~= "arm" and len > 0 then
-      seek(play_pos + d * (len / 100))
+      seek(play_pos + d) -- one beat per click
     end
   elseif n == 3 then
     if d ~= 0 then
@@ -634,10 +729,13 @@ function redraw()
   screen.move(0, 8)
   screen.text("midirec")
 
-  -- grid keyboard scale
+  -- row 2: grid keyboard scale left, tempo + clock source right
   screen.level(4)
   screen.move(0, 18)
   screen.text(scale_label())
+  screen.move(128, 18)
+  screen.text_right(string.format("%d %s", clock.get_tempo() + 0.5,
+    params:string("clock_source")))
 
   -- take name. while recording, show the take this will be saved as, so
   -- the header does not lag behind until the recording stops.
@@ -657,6 +755,10 @@ function redraw()
     -- waiting for the first note. blink so it reads as live, not stuck.
     screen.level(math.floor(util.time() * 2) % 2 == 0 and 15 or 6)
     screen.text("● ARM")
+    screen.level(15)
+  elseif state == "play" and launch_pending then
+    screen.level(math.floor(util.time() * 4) % 2 == 0 and 15 or 6)
+    screen.text("▶ WAIT")
     screen.level(15)
   elseif state == "play" then
     screen.text("▶ PLAY")
@@ -679,11 +781,11 @@ function redraw()
   -- time
   screen.move(128, 30)
   if state == "rec" then
-    screen.text_right(fmt_time(util.time() - rec_start))
+    screen.text_right(fmt_pos(clock.get_beats() - rec_start))
   elseif state == "arm" then
-    screen.text_right(fmt_time(0))
+    screen.text_right(fmt_pos(0))
   else
-    screen.text_right(fmt_time(play_pos) .. " / " .. fmt_time(len))
+    screen.text_right(fmt_pos(play_pos) .. " / " .. fmt_len(len))
   end
 
   -- position bar
