@@ -7,7 +7,8 @@
 -- E2 scrub (not rec)
 -- E3 loop on / off
 -- grid: one cell per take,
--- press to queue (or load)
+-- press to play, or queue
+-- while playing
 --
 -- params: in/out port, loop,
 -- rec on first note,
@@ -313,7 +314,15 @@ end
 local function grid_key(x, y, z)
   if z ~= 1 then return end
   local cols = g.cols or 16
-  select_take((y - 1) * cols + x)
+  local i = (y - 1) * cols + x
+  if state == "stop" and takes[i] then
+    -- from stop, a grid press is "play this one", not just "select it"
+    load_take(i)
+    take_sel = i
+    start_play()
+  else
+    select_take(i)
+  end
   redraw()
 end
 
