@@ -7,12 +7,12 @@
 -- E2 scrub (not rec)
 -- E3 loop on / off
 -- grid: takes, or keyboard.
--- bottom row: stop, rec, -, menu
+-- bottom row: scale ... stop, rec, -, menu
 --
 -- params: in/out port, loop,
 -- rec on first note,
 -- echo rec / standby / play,
--- grid channel / velocity / base
+-- grid channel / velocity / base / scale
 
 local recfile = include("midirec/lib/recfile")
 local musicutil = require("musicutil")
@@ -24,8 +24,14 @@ local midi_out
 local g              -- grid, if one is attached
 local grid_mode = "takes" -- "takes" | "keys"
 local keys_held = {}      -- [note] = number of grid cells holding it
-local KEY_ROW = 5         -- semitones per row (fourths)
--- keyboard base note, channel, velocity are params: grid_base, grid_ch, grid_vel
+-- keyboard base note, channel, velocity, scale are params
+local SCALES = {
+  "Chromatic", "Major", "Natural Minor", "Dorian", "Mixolydian", "Lydian",
+  "Phrygian", "Harmonic Minor", "Major Pentatonic", "Minor Pentatonic",
+  "Blues Scale", "Whole Tone",
+}
+local scale_notes = {}    -- note numbers of the current scale, from base
+local scale_row = 5       -- scale degrees per row up the grid
 
 local state = "stop" -- "stop" | "arm" | "rec" | "play"
 -- "arm": record pressed with "rec on note" on. nothing is timed or stored
@@ -357,6 +363,7 @@ end
 --   [cols-1] blank
 --   [cols-2] record (K3)
 --   [cols-3] stop / play (K2)
+--   [1]      keyboard mode only: next scale
 -- rows above it: takes mode, one cell per take, left to right then down.
 -- keyboard mode, notes in fourths: +1 per column, +5 per row going up,
 -- lowest note bottom-left. notes always sound on the out port and are
@@ -366,14 +373,41 @@ local function grid_dims()
   return g.cols or 16, g.rows or 8
 end
 
+-- rebuild the note table for the current base and scale. rows step by the
+-- number of degrees closest to a fourth, so chromatic is the usual fourths
+-- layout and a 7-note scale steps 3 degrees, a pentatonic 2.
+local function build_scale()
+  local name = SCALES[params:get("grid_scale")]
+  local n = 12
+  for _, sc in ipairs(musicutil.SCALES) do
+    if sc.name == name then n = #sc.intervals - 1 end -- drop the octave
+  end
+  scale_row = math.max(1, math.floor(n * 5 / 12 + 0.5))
+  local cols, rows = 16, 8
+  if g then cols, rows = grid_dims() end
+  local length = cols + (rows - 2) * scale_row
+  local notes = musicutil.generate_scale_of_length(
+    params:get("grid_base"), name, length) or {}
+  scale_notes = {}
+  for i, note in ipairs(notes) do
+    if note <= 127 then scale_notes[i] = note end
+  end
+end
+
+local function scale_label()
+  local root = musicutil.note_num_to_name(params:get("grid_base"), true)
+  return root .. " " .. SCALES[params:get("grid_scale")]:lower()
+end
+
 local function grid_pos(i)
   local cols = grid_dims()
   return (i - 1) % cols + 1, (i - 1) // cols + 1
 end
 
+-- may return nil past the top of the scale table
 local function grid_note(x, y)
   local _, rows = grid_dims()
-  return params:get("grid_base") + (x - 1) + ((rows - 1) - y) * KEY_ROW
+  return scale_notes[(x - 1) + ((rows - 1) - y) * scale_row + 1]
 end
 
 local function keys_send(note, on)
@@ -386,7 +420,7 @@ end
 -- several cells share a note in a fourths layout, so count holds per note
 -- and only send when the count crosses zero
 local function keys_press(note, z)
-  if note < 0 or note > 127 then return end
+  if not note then return end
   local n = keys_held[note] or 0
   if z == 1 then
     if n == 0 then keys_send(note, true) end
@@ -419,13 +453,17 @@ local function grid_redraw()
       g:led(x, y, lvl)
     end
   else
+    local root = params:get("grid_base") % 12
     for y = 1, rows - 1 do
       for x = 1, cols do
         local note = grid_note(x, y)
-        local lvl = keys_held[note] and 15 or (note % 12 == 0 and 6 or 2)
-        g:led(x, y, lvl)
+        if note then
+          local lvl = keys_held[note] and 15 or (note % 12 == root and 6 or 2)
+          g:led(x, y, lvl)
+        end
       end
     end
+    g:led(1, rows, 8) -- scale
   end
   -- control row
   g:led(cols, rows, 15)
@@ -439,7 +477,10 @@ local function grid_key(x, y, z)
   local cols, rows = grid_dims()
   if y == rows then
     if z ~= 1 then return end
-    if x == cols then
+    if x == 1 and grid_mode == "keys" then
+      local n = params:get("grid_scale") % #SCALES + 1
+      params:set("grid_scale", n)
+    elseif x == cols then
       if grid_mode == "keys" then
         keys_release()
         grid_mode = "takes"
@@ -508,7 +549,9 @@ function init()
     function(p) return musicutil.note_num_to_name(p:get(), true) end)
   -- a base note change while keys are held would send note-offs for the
   -- wrong pitches, so release first
-  params:set_action("grid_base", function() keys_release() end)
+  params:add_option("grid_scale", "grid scale", SCALES, 1)
+  params:set_action("grid_base", function() keys_release(); build_scale() end)
+  params:set_action("grid_scale", function() keys_release(); build_scale() end)
   params:set_action("grid_ch", function() keys_release() end)
 
   params:add_option("echo_rec", "echo rec", {"off", "on"}, 2)
@@ -522,6 +565,7 @@ function init()
 
   g = grid.connect()
   g.key = grid_key
+  build_scale()
 
   screen_metro = metro.init(function()
     if norns.menu.status() == false then redraw() end
@@ -579,6 +623,11 @@ function redraw()
   screen.level(4)
   screen.move(0, 8)
   screen.text("midirec")
+
+  -- grid keyboard scale
+  screen.level(4)
+  screen.move(0, 18)
+  screen.text(scale_label())
 
   -- take name. while recording, show the take this will be saved as, so
   -- the header does not lag behind until the recording stops.
