@@ -6,6 +6,8 @@
 -- K3 record / stop
 -- E2 scrub (not rec)
 -- E3 loop on / off
+-- grid: one cell per take,
+-- press to queue (or load)
 --
 -- params: in/out port, loop,
 -- rec on first note,
@@ -17,6 +19,7 @@ local DATA_DIR = _path.data .. "midirec/"
 
 local midi_in
 local midi_out
+local g              -- grid, if one is attached
 
 local state = "stop" -- "stop" | "arm" | "rec" | "play"
 -- "arm": record pressed with "rec on note" on. nothing is timed or stored
@@ -269,6 +272,51 @@ local function load_take(i)
   read_take(i)
 end
 
+-- pick take i from E1 or the grid. during play this queues it for the end
+-- of the current pass rather than interrupting; picking the take that is
+-- already playing cancels the queue. while recording it is ignored.
+local function select_take(i)
+  if not takes[i] then return end
+  if state == "rec" or state == "arm" then return end
+  take_sel = i
+  if state == "play" then
+    queued = i ~= loaded and i or nil
+  else
+    load_take(i)
+  end
+end
+
+-- grid: take i lives at column (i-1) % cols + 1, row (i-1) // cols + 1.
+-- existing takes dim, the loaded take bright, a queued take blinks.
+local function grid_pos(i)
+  local cols = g.cols or 16
+  return (i - 1) % cols + 1, (i - 1) // cols + 1
+end
+
+local function grid_redraw()
+  if not g or not g.device then return end
+  g:all(0)
+  local blink = math.floor(util.time() * 4) % 2 == 0
+  for i = 1, #takes do
+    local x, y = grid_pos(i)
+    local lvl = 4
+    if i == queued then
+      lvl = blink and 12 or 6
+    elseif i == loaded then
+      lvl = 15
+    end
+    g:led(x, y, lvl)
+  end
+  g:refresh()
+end
+
+local function grid_key(x, y, z)
+  if z ~= 1 then return end
+  local cols = g.cols or 16
+  select_take((y - 1) * cols + x)
+  redraw()
+end
+
 -- midi input ----------------------------------------------------------
 
 local function midi_event(data)
@@ -339,8 +387,12 @@ function init()
 
   params:bang()
 
+  g = grid.connect()
+  g.key = grid_key
+
   screen_metro = metro.init(function()
     if norns.menu.status() == false then redraw() end
+    grid_redraw()
   end, 1 / 15)
   screen_metro:start()
 end
@@ -349,6 +401,10 @@ function cleanup()
   stop()
   all_notes_off()
   if screen_metro then screen_metro:stop() end
+  if g then
+    g.key = nil
+    if g.device then g:all(0); g:refresh() end
+  end
   if midi_in then midi_in.event = nil end
 end
 
@@ -380,16 +436,7 @@ function enc(n, d)
   if n == 1 then
     if #takes > 0 then
       local new = util.clamp(take_sel + d, 1, #takes)
-      if new ~= take_sel then
-        take_sel = new
-        if state == "play" then
-          -- don't interrupt: queue it for the end of this pass. turning
-          -- back to the playing take cancels the queue.
-          queued = new ~= loaded and new or nil
-        else
-          load_take(take_sel)
-        end
-      end
+      if new ~= take_sel then select_take(new) end
     end
   elseif n == 2 then
     if state ~= "rec" and state ~= "arm" and len > 0 then
