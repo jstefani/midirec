@@ -444,7 +444,9 @@ local function grid_redraw()
   if grid_mode == "takes" then
     for i = 1, math.min(#takes, cols * (rows - 1)) do
       local x, y = grid_pos(i)
-      local lvl = 4
+      -- 8 is half bright on varibright and the lowest level a monobright
+      -- grid shows as on, so one value covers both
+      local lvl = 8
       if i == queued then
         lvl = blink and 12 or 6
       elseif i == loaded then
@@ -458,7 +460,7 @@ local function grid_redraw()
       for x = 1, cols do
         local note = grid_note(x, y)
         if note then
-          local lvl = keys_held[note] and 15 or (note % 12 == root and 6 or 2)
+          local lvl = keys_held[note] and 15 or (note % 12 == root and 8 or 2)
           g:led(x, y, lvl)
         end
       end
