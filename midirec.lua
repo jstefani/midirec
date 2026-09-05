@@ -7,7 +7,8 @@
 -- E2 scrub (not rec)
 -- E3 loop on / off
 -- grid: takes, or keyboard.
--- bottom row: scale ... stop, rec, -, menu
+-- bottom row: scale oct- oct+ hold
+--   ... stop rec loop menu
 --
 -- time is in beats from the norns
 -- clock (PARAMETERS > CLOCK sets
@@ -30,6 +31,11 @@ local midi_out
 local g              -- grid, if one is attached
 local grid_mode = "takes" -- "takes" | "keys"
 local keys_held = {}      -- [note] = number of grid cells holding it
+local hold_on = false     -- keyboard hold: notes latch until pressed again
+local oct_down = false    -- octave keys pressed, for their leds
+local oct_up = false
+local scale_down = false  -- scale key held; with a note press it sets the root
+local scale_used = false  -- ...and if it did, releasing it does not step scales
 -- keyboard base note, channel, velocity, scale are params
 local SCALES = {
   "Chromatic", "Major", "Natural Minor", "Dorian", "Mixolydian", "Lydian",
@@ -477,10 +483,12 @@ end
 --
 -- bottom row is a control row in both modes, from the right:
 --   [cols]   menu: toggle takes <-> keyboard. always lit.
---   [cols-1] blank
+--   [cols-1] loop on / off (E3)
 --   [cols-2] record (K3)
 --   [cols-3] stop / play (K2)
---   [1]      keyboard mode only: next scale
+-- keyboard mode only, from the left:
+--   [1] tap: next scale. hold + press a note: set root to that pitch
+--   [2] octave down   [3] octave up   [4] hold (latch) on / off
 -- rows above it: takes mode, one cell per take, left to right then down.
 -- keyboard mode, notes in fourths: +1 per column, +5 per row going up,
 -- lowest note bottom-left. notes always sound on the out port and are
@@ -539,6 +547,18 @@ end
 local function keys_press(note, z)
   if not note then return end
   local n = keys_held[note] or 0
+  if hold_on then
+    -- latch: press toggles, release does nothing
+    if z ~= 1 then return end
+    if n > 0 then
+      keys_send(note, false)
+      keys_held[note] = nil
+    else
+      keys_send(note, true)
+      keys_held[note] = 1
+    end
+    return
+  end
   if z == 1 then
     if n == 0 then keys_send(note, true) end
     keys_held[note] = n + 1
@@ -551,6 +571,24 @@ end
 local function keys_release()
   for note in pairs(keys_held) do keys_send(note, false) end
   keys_held = {}
+end
+
+-- move the keyboard root to the pitch class of `note`, staying in the
+-- octave nearest the current base so the layout does not jump registers
+local function set_root(note)
+  local base = params:get("grid_base")
+  local pc = note % 12
+  local best, dist = base, 999
+  for cand = pc, 127, 12 do
+    local d = math.abs(cand - base)
+    if d < dist then best, dist = cand, d end
+  end
+  params:set("grid_base", best)
+end
+
+local function shift_octave(d)
+  local b = params:get("grid_base") + d * 12
+  if b >= 0 and b <= 127 then params:set("grid_base", b) end
 end
 
 local function grid_redraw()
@@ -589,7 +627,12 @@ local function grid_redraw()
         end
       end
     end
-    g:led(1, rows, 8) -- scale
+    -- keyboard controls: scale, oct-, oct+, hold. momentary keys idle at 8
+    -- and go full while pressed; hold is a toggle, off dark on monobright
+    g:led(1, rows, scale_down and 15 or 8)
+    g:led(2, rows, oct_down and 15 or 8)
+    g:led(3, rows, oct_up and 15 or 8)
+    g:led(4, rows, hold_on and 15 or 4)
   end
   -- control row. rec and stop idle at 8 so they read as buttons, full on
   -- when active
@@ -597,19 +640,45 @@ local function grid_redraw()
   g:led(cols - 2, rows,
     state == "rec" and 15 or (state == "arm" and (blink and 15 or 8)) or 8)
   g:led(cols - 3, rows, state == "play" and 15 or 8)
+  g:led(cols - 1, rows, params:get("loop") == 2 and 15 or 4) -- loop toggle
   g:refresh()
 end
 
 local function grid_key(x, y, z)
   local cols, rows = grid_dims()
   if y == rows then
+    local keys = grid_mode == "keys"
+    -- momentary keyboard controls need the release too
+    if keys and x == 1 then
+      if z == 1 then
+        scale_down, scale_used = true, false
+      else
+        scale_down = false
+        -- a plain tap steps the scale; a hold used to set the root does not
+        if not scale_used then
+          params:set("grid_scale", params:get("grid_scale") % #SCALES + 1)
+        end
+      end
+      return
+    elseif keys and x == 2 then
+      oct_down = z == 1
+      if z == 1 then shift_octave(-1) end
+      return
+    elseif keys and x == 3 then
+      oct_up = z == 1
+      if z == 1 then shift_octave(1) end
+      return
+    end
     if z ~= 1 then return end
-    if x == 1 and grid_mode == "keys" then
-      local n = params:get("grid_scale") % #SCALES + 1
-      params:set("grid_scale", n)
+    if keys and x == 4 then
+      hold_on = not hold_on
+      if not hold_on then keys_release() end
+    elseif x == cols - 1 then
+      params:set("loop", params:get("loop") == 2 and 1 or 2)
     elseif x == cols then
       if grid_mode == "keys" then
         keys_release()
+        hold_on = false
         grid_mode = "takes"
       else
         grid_mode = "keys"
@@ -623,7 +692,16 @@ local function grid_key(x, y, z)
     return
   end
   if grid_mode == "keys" then
-    keys_press(grid_note(x, y), z)
+    local note = grid_note(x, y)
+    if scale_down then
+      -- scale key held: this press picks the root instead of playing
+      if z == 1 and note then
+        scale_used = true
+        set_root(note)
+      end
+      return
+    end
+    keys_press(note, z)
     return
   end
   if z ~= 1 then return end
