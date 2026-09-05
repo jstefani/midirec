@@ -440,7 +440,8 @@ local function grid_redraw()
   if not g or not g.device then return end
   local cols, rows = grid_dims()
   g:all(0)
-  local blink = math.floor(util.time() * 4) % 2 == 0
+  local blink = math.floor(util.time() * 4) % 2 == 0       -- queued: fast
+  local slow = math.floor(util.time() * 1.5) % 2 == 0      -- playing: slow
   if grid_mode == "takes" then
     for i = 1, math.min(#takes, cols * (rows - 1)) do
       local x, y = grid_pos(i)
@@ -450,7 +451,8 @@ local function grid_redraw()
       if i == queued then
         lvl = blink and 12 or 6
       elseif i == loaded then
-        lvl = 15
+        -- steady when loaded but stopped, slow flash while playing
+        lvl = (state == "play" and not slow) and 6 or 15
       end
       g:led(x, y, lvl)
     end
