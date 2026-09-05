@@ -11,9 +11,11 @@
 --
 -- params: in/out port, loop,
 -- rec on first note,
--- echo rec / standby / play
+-- echo rec / standby / play,
+-- grid channel / velocity / base
 
 local recfile = include("midirec/lib/recfile")
+local musicutil = require("musicutil")
 
 local DATA_DIR = _path.data .. "midirec/"
 
@@ -22,10 +24,8 @@ local midi_out
 local g              -- grid, if one is attached
 local grid_mode = "takes" -- "takes" | "keys"
 local keys_held = {}      -- [note] = number of grid cells holding it
-local KEY_BASE = 36       -- bottom-left note of the keyboard (C2)
 local KEY_ROW = 5         -- semitones per row (fourths)
-local KEY_CH = 1
-local KEY_VEL = 100
+-- keyboard base note, channel, velocity are params: grid_base, grid_ch, grid_vel
 
 local state = "stop" -- "stop" | "arm" | "rec" | "play"
 -- "arm": record pressed with "rec on note" on. nothing is timed or stored
@@ -373,12 +373,12 @@ end
 
 local function grid_note(x, y)
   local _, rows = grid_dims()
-  return KEY_BASE + (x - 1) + ((rows - 1) - y) * KEY_ROW
+  return params:get("grid_base") + (x - 1) + ((rows - 1) - y) * KEY_ROW
 end
 
 local function keys_send(note, on)
-  local status = (on and 0x90 or 0x80) + KEY_CH - 1
-  local data = {status, note, on and KEY_VEL or 0}
+  local status = (on and 0x90 or 0x80) + params:get("grid_ch") - 1
+  local data = {status, note, on and params:get("grid_vel") or 0}
   send(data, "echo")
   record(data)
 end
@@ -500,6 +500,16 @@ function init()
 
   params:add_option("loop", "loop", {"off", "on"}, 1)
   params:add_option("rec_on_note", "rec on first note", {"off", "on"}, 1)
+
+  params:add_separator("grid keyboard")
+  params:add_number("grid_ch", "grid channel", 1, 16, 1)
+  params:add_number("grid_vel", "grid velocity", 1, 127, 100)
+  params:add_number("grid_base", "grid base note", 0, 127, 36,
+    function(p) return musicutil.note_num_to_name(p:get(), true) end)
+  -- a base note change while keys are held would send note-offs for the
+  -- wrong pitches, so release first
+  params:set_action("grid_base", function() keys_release() end)
+  params:set_action("grid_ch", function() keys_release() end)
 
   params:add_option("echo_rec", "echo rec", {"off", "on"}, 2)
   params:add_option("echo_standby", "echo standby", {"off", "on"}, 2)
