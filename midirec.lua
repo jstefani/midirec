@@ -13,6 +13,9 @@
 -- time is in beats from the norns
 -- clock (PARAMETERS > CLOCK sets
 -- source + tempo). 4/4 assumed.
+-- bar 1 is wherever play or rec
+-- first starts from idle (next
+-- beat), or an external start.
 --
 -- play mode multi: grid presses
 -- layer takes, press again to
@@ -76,6 +79,13 @@ local play_pos = 0   -- where K2 starts it from; mirrors its player while playin
 local players = {}
 
 local rec_start = 0  -- beat the current recording started (may be snapped)
+
+-- neither midi clock nor the internal clock knows where a bar is, so we
+-- define it: `origin` is the global beat that is bar 1 beat 1. it is set
+-- when play or record starts from idle (nothing playing, not recording),
+-- on the next beat, and on an external transport start. every launch
+-- after that quantizes to bars measured from it.
+local origin = 0
 local screen_metro
 
 local takes = {}     -- list of filenames in DATA_DIR
@@ -320,6 +330,7 @@ local function player_start(i, pos, immediate)
   if player_for(i) then return end
   local e, l = load_file(i)
   if not e or #e == 0 or l <= 0 then return end
+  local from_idle = #players == 0 and state ~= "rec" and state ~= "arm"
   local p = {take = i, events = e, len = l, pos = pos or 0, idx = 1, t0 = 0,
     pending = false}
   p.pe = derive(e, l)
@@ -327,12 +338,22 @@ local function player_start(i, pos, immediate)
   update_state()
   p.clock = clock.run(function()
     local q = (not immediate) and quant("launch_quant")
-    if q then
-      -- clock.sync waits for the next multiple of q on the global beat
-      -- grid, so every take launches on the same grid
+    if q and from_idle then
+      -- nothing else is running: the next beat is the downbeat. set origin
+      -- before waiting so a second take started during the wait syncs to it
+      origin = math.ceil(clock.get_beats() + 1e-6)
       p.pending = true
-      clock.sync(q)
+      clock.sync(1)
       p.pending = false
+      origin = round_to(clock.get_beats(), 1)
+    elseif q then
+      -- wait for the next multiple of q on our own bar grid (the offset
+      -- shifts the scheduler's grid to origin), so takes fall in together
+      p.pending = true
+      clock.sync(q, origin % q)
+      p.pending = false
+    elseif from_idle then
+      origin = clock.get_beats()
     end
     player_seek(p, p.pos)
     while true do
@@ -423,10 +444,12 @@ local function start_rec()
   events = {}
   len = 0
   play_pos = 0
-  -- snap the start to the nearest launch-quantize boundary. pressed just
-  -- after a downbeat the take starts on that downbeat; pressed just before,
-  -- anything played early lands at t = 0.
-  rec_start = round_to(clock.get_beats(), quant("launch_quant"))
+  -- stop() ran, so nothing else is playing: this recording defines the bar.
+  -- with launch quantize on, snap to the nearest beat. pressed just after
+  -- a beat the take starts on that beat; pressed just before, anything
+  -- played early lands at t = 0.
+  rec_start = round_to(clock.get_beats(), quant("launch_quant") and 1)
+  origin = rec_start
   rec_name = next_take_name()
   loaded = nil
   state = params:get("rec_on_note") == 2 and "arm" or "rec"
@@ -547,11 +570,12 @@ local function record(data)
   if state == "arm" then
     local msg = midi.to_msg(data)
     if msg.type == "note_on" and msg.vel > 0 then
-      -- the first note is t = 0. with launch quantize on, snap the start to
-      -- the nearest beat so the take sits on the grid; the note itself lands
-      -- at 0 if it was early, or a hair after 0 if late.
+      -- the first note is t = 0 and defines the bar. with launch quantize
+      -- on, snap to the nearest beat so the take sits on the grid; the note
+      -- itself lands at 0 if it was early, or a hair after 0 if late.
       local b = clock.get_beats()
-      rec_start = quant("launch_quant") and round_to(b, 1) or b
+      rec_start = round_to(b, quant("launch_quant") and 1)
+      origin = rec_start
       state = "rec"
     end
   end
@@ -920,6 +944,7 @@ function init()
   -- count on start, so playing from 0 right now is on the grid already.
   clock.transport.start = function()
     if params:get("follow") == 2 and state == "stop" and loaded then
+      origin = clock.get_beats() -- the sender's downbeat is now
       play_pos = 0
       start_play(true)
     end
