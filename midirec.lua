@@ -38,8 +38,8 @@ local g              -- grid, if one is attached
 local grid_mode = "takes" -- "takes" | "keys"
 local keys_held = {}      -- [note] = number of grid cells holding it
 local hold_on = false     -- keyboard hold: notes latch until pressed again
-local oct_down = false    -- octave keys pressed, for their leds
-local oct_up = false
+local flash_until = {}    -- [key] = time; momentary led feedback for taps
+local FLASH = 0.15        -- seconds a tapped control key stays lit
 local scale_down = false  -- scale key held; with a note press it sets the root
 local scale_used = false  -- ...and if it did, releasing it does not step scales
 -- keyboard base note, channel, velocity, scale are params
@@ -686,6 +686,10 @@ local function set_root(note)
   params:set("grid_base", best)
 end
 
+-- light control key `k` for FLASH seconds so even a quick tap is visible
+local function flash(k) flash_until[k] = util.time() + FLASH end
+local function flashing(k) return (flash_until[k] or 0) > util.time() end
+
 local function shift_octave(d)
   local b = params:get("grid_base") + d * 12
   if b >= 0 and b <= 127 then params:set("grid_base", b) end
@@ -730,11 +734,11 @@ local function grid_redraw()
         end
       end
     end
-    -- keyboard controls: scale, oct-, oct+, hold. momentary keys idle at 8
-    -- and go full while pressed; hold is a toggle, off dark on monobright
+    -- keyboard controls: scale, oct-, oct+, hold. octave keys idle low
+    -- (dark on monobright) and flash on a tap; hold is a toggle, off dark
     g:led(1, rows, scale_down and 15 or 8)
-    g:led(2, rows, oct_down and 15 or 8)
-    g:led(3, rows, oct_up and 15 or 8)
+    g:led(2, rows, flashing("oct_down") and 15 or 4)
+    g:led(3, rows, flashing("oct_up") and 15 or 4)
     g:led(4, rows, hold_on and 15 or 4)
   end
   -- control row. rec and stop idle at 8 so they read as buttons, full on
@@ -743,7 +747,13 @@ local function grid_redraw()
   g:led(cols - 2, rows,
     state == "rec" and 15 or (state == "arm" and (blink and 15 or 8)) or 8)
   g:led(cols - 3, rows, state == "play" and 15 or 8)
-  g:led(cols - 1, rows, params:get("loop") == 2 and 15 or 4) -- loop toggle
+  -- loop key: shows on/off in takes mode. on the keyboard page it stays
+  -- dark and only flashes on a tap, so the row reads as controls, not state
+  if grid_mode == "keys" then
+    g:led(cols - 1, rows, flashing("loop") and 15 or 0)
+  else
+    g:led(cols - 1, rows, params:get("loop") == 2 and 15 or 4)
+  end
   g:refresh()
 end
 
@@ -764,12 +774,10 @@ local function grid_key(x, y, z)
       end
       return
     elseif keys and x == 2 then
-      oct_down = z == 1
-      if z == 1 then shift_octave(-1) end
+      if z == 1 then flash("oct_down"); shift_octave(-1) end
       return
     elseif keys and x == 3 then
-      oct_up = z == 1
-      if z == 1 then shift_octave(1) end
+      if z == 1 then flash("oct_up"); shift_octave(1) end
       return
     end
     if z ~= 1 then return end
@@ -777,6 +785,7 @@ local function grid_key(x, y, z)
       hold_on = not hold_on
       if not hold_on then keys_release() end
     elseif x == cols - 1 then
+      flash("loop")
       params:set("loop", params:get("loop") == 2 and 1 or 2)
     elseif x == cols then
       if grid_mode == "keys" then
