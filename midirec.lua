@@ -440,8 +440,11 @@ local function grid_redraw()
   if not g or not g.device then return end
   local cols, rows = grid_dims()
   g:all(0)
-  local blink = math.floor(util.time() * 4) % 2 == 0       -- queued: fast
-  local slow = math.floor(util.time() * 1.5) % 2 == 0      -- playing: slow
+  -- one time sample, fast rate exactly 2x slow, so every slow edge lands
+  -- on a fast edge and the two never drift apart
+  local t = util.time()
+  local blink = math.floor(t * 4) % 2 == 0   -- queued: fast (2 Hz)
+  local slow = math.floor(t * 2) % 2 == 0    -- playing: slow (1 Hz)
   if grid_mode == "takes" then
     for i = 1, math.min(#takes, cols * (rows - 1)) do
       local x, y = grid_pos(i)
