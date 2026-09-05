@@ -15,7 +15,7 @@
 --
 -- params: in/out port, loop,
 -- rec on first note,
--- length / launch quantize,
+-- length / launch / play quantize,
 -- follow transport,
 -- echo rec / standby / play,
 -- grid channel / velocity / base / scale
@@ -49,7 +49,8 @@ local state = "stop" -- "stop" | "arm" | "rec" | "play"
 -- without any clock parsing here.
 local BEATS_PER_BAR = 4   -- 4/4 assumed for now
 
-local events = {}    -- {t = beats from take start, data = {bytes...}}
+local events = {}    -- {t = beats from take start, data = {bytes...}} raw, as played
+local play_events = {} -- what playback reads: events with play quantize applied
 local len = 0        -- take length in beats
 
 local rec_start = 0  -- beat the current recording started (may be snapped)
@@ -99,6 +100,46 @@ end
 local function round_to(b, q)
   if not q then return b end
   return math.floor(b / q + 0.5) * q
+end
+
+-- play quantize is applied on the way out, never to the stored take, so it
+-- can be changed or turned off later. note-ons snap to the grid; each
+-- note-off moves by the same offset as its note-on so durations survive.
+-- cc, bend, pressure are left alone. a note pushed past the loop end wraps
+-- to the start of the pass.
+local PLAY_QUANT = {nil, 1, 1 / 2, 1 / 4, 1 / 8} -- off, 1/4, 1/8, 1/16, 1/32
+local function rebuild_play()
+  local q = PLAY_QUANT[params:get("play_quant")]
+  play_events = {}
+  if not q or len <= 0 then
+    for i, e in ipairs(events) do play_events[i] = e end
+    return
+  end
+  local shift = {} -- [ch*128+note] = offset applied to the pending note-on
+  for i, e in ipairs(events) do
+    local t = e.t
+    local m = midi.to_msg(e.data)
+    if m and m.ch then
+      local k = m.ch * 128 + (m.note or 0)
+      if m.type == "note_on" and m.vel > 0 then
+        local qt = round_to(t, q)
+        shift[k] = qt - t
+        t = qt
+      elseif m.type == "note_off" or (m.type == "note_on" and m.vel == 0) then
+        if shift[k] then
+          t = t + shift[k]
+          shift[k] = nil
+        end
+      end
+    end
+    play_events[#play_events + 1] = {t = t % len, data = e.data, i = i}
+  end
+  -- table.sort is not stable: break ties on recorded order so a note-off
+  -- and the next note-on of the same pitch at one grid point keep their order
+  table.sort(play_events, function(a, b)
+    if a.t == b.t then return a.i < b.i end
+    return a.t < b.t
+  end)
 end
 
 local function scan_takes()
@@ -209,6 +250,7 @@ local function stop()
       end
     end
     dirty = #events > 0
+    rebuild_play()
   elseif state == "arm" then
     len = 0
     dirty = false
@@ -224,6 +266,7 @@ end
 local function start_rec()
   stop()
   events = {}
+  play_events = {}
   len = 0
   play_pos = 0
   -- snap the start to the nearest launch-quantize boundary. pressed just
@@ -238,7 +281,7 @@ end
 local function seek(pos)
   play_pos = util.clamp(pos, 0, len)
   play_idx = 1
-  while play_idx <= #events and events[play_idx].t < play_pos do
+  while play_idx <= #play_events and play_events[play_idx].t < play_pos do
     play_idx = play_idx + 1
   end
   if state == "play" then play_t0 = clock.get_beats() - play_pos end
@@ -265,8 +308,8 @@ local function start_play(immediate)
     while true do
       clock.sleep(1 / 200)
       play_pos = clock.get_beats() - play_t0
-      while play_idx <= #events and events[play_idx].t <= play_pos do
-        send(events[play_idx].data, "play")
+      while play_idx <= #play_events and play_events[play_idx].t <= play_pos do
+        send(play_events[play_idx].data, "play")
         play_idx = play_idx + 1
       end
       if play_pos >= len then
@@ -332,6 +375,7 @@ read_take = function(i)
   if e then
     events = e
     len = l
+    rebuild_play()
     play_pos = 0
     play_idx = 1
     dirty = false
@@ -629,6 +673,14 @@ function init()
   local QUANT = {"off", "beat", "bar"}
   params:add_option("len_quant", "length quantize", QUANT, 3)
   params:add_option("launch_quant", "launch quantize", QUANT, 3)
+  params:add_option("play_quant", "play quantize",
+    {"off", "1/4", "1/8", "1/16", "1/32"}, 1)
+  -- re-derive the playback table in place. mid-pass the index is re-found
+  -- from the current position so nothing double-fires.
+  params:set_action("play_quant", function()
+    rebuild_play()
+    if state == "play" then seek(play_pos) end
+  end)
   -- with an external clock source, its start plays the loaded take from 0
   -- and its stop stops playback
   params:add_option("follow", "follow transport", {"off", "on"}, 2)
