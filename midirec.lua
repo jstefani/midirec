@@ -848,6 +848,9 @@ end
 function init()
   util.make_dir(DATA_DIR)
   scan_takes()
+  -- the header shows take_sel from the start, so K2 / the grid play key
+  -- must have it loaded too
+  if #takes > 0 then read_take(take_sel) end
 
   params:add_separator("midirec")
 
