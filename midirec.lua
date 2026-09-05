@@ -465,11 +465,12 @@ local function grid_redraw()
     end
     g:led(1, rows, 8) -- scale
   end
-  -- control row
+  -- control row. rec and stop idle at 8 so they read as buttons, full on
+  -- when active
   g:led(cols, rows, 15)
   g:led(cols - 2, rows,
-    state == "rec" and 15 or (state == "arm" and (blink and 15 or 4)) or 4)
-  g:led(cols - 3, rows, state == "play" and 15 or 4)
+    state == "rec" and 15 or (state == "arm" and (blink and 15 or 8)) or 8)
+  g:led(cols - 3, rows, state == "play" and 15 or 8)
   g:refresh()
 end
 
