@@ -6,9 +6,8 @@
 -- K3 record / stop
 -- E2 scrub (not rec)
 -- E3 loop on / off
--- grid: one cell per take,
--- press to play, or queue
--- while playing
+-- grid: takes, or keyboard.
+-- bottom row: stop, rec, -, menu
 --
 -- params: in/out port, loop,
 -- rec on first note,
@@ -21,6 +20,12 @@ local DATA_DIR = _path.data .. "midirec/"
 local midi_in
 local midi_out
 local g              -- grid, if one is attached
+local grid_mode = "takes" -- "takes" | "keys"
+local keys_held = {}      -- [note] = number of grid cells holding it
+local KEY_BASE = 36       -- bottom-left note of the keyboard (C2)
+local KEY_ROW = 5         -- semitones per row (fourths)
+local KEY_CH = 1
+local KEY_VEL = 100
 
 local state = "stop" -- "stop" | "arm" | "rec" | "play"
 -- "arm": record pressed with "rec on note" on. nothing is timed or stored
@@ -287,61 +292,34 @@ local function select_take(i)
   end
 end
 
--- grid: take i lives at column (i-1) % cols + 1, row (i-1) // cols + 1.
--- existing takes dim, the loaded take bright, a queued take blinks.
-local function grid_pos(i)
-  local cols = g.cols or 16
-  return (i - 1) % cols + 1, (i - 1) // cols + 1
-end
-
-local function grid_redraw()
-  if not g or not g.device then return end
-  g:all(0)
-  local blink = math.floor(util.time() * 4) % 2 == 0
-  for i = 1, #takes do
-    local x, y = grid_pos(i)
-    local lvl = 4
-    if i == queued then
-      lvl = blink and 12 or 6
-    elseif i == loaded then
-      lvl = 15
-    end
-    g:led(x, y, lvl)
-  end
-  g:refresh()
-end
-
-local function grid_key(x, y, z)
-  if z ~= 1 then return end
-  local cols = g.cols or 16
-  local i = (y - 1) * cols + x
-  if state == "stop" and takes[i] then
-    -- from stop, a grid press is "play this one", not just "select it"
-    load_take(i)
-    take_sel = i
-    start_play()
+-- transport buttons. K2/K3 on the device and the grid control row both
+-- land here so they cannot drift apart.
+local function k2_press()
+  if state == "play" then
+    stop()
+  elseif state == "rec" or state == "arm" then
+    stop()
+    save_take()
   else
-    select_take(i)
+    start_play()
   end
-  redraw()
+end
+
+local function k3_press()
+  if state == "rec" or state == "arm" then
+    stop()
+    save_take()
+  else
+    start_rec()
+  end
 end
 
 -- midi input ----------------------------------------------------------
 
-local function midi_event(data)
-  local echo
-  if state == "rec" or state == "arm" then
-    echo = params:get("echo_rec") == 2
-  elseif state == "stop" then
-    echo = params:get("echo_standby") == 2
-  elseif state == "play" then
-    echo = params:get("echo_play") == 2
-  else
-    echo = false
-  end
-  if echo then send(data, "echo") end
+-- store a message into the take if recording. the first note-on while
+-- armed starts the clock; anything before it is dropped.
+local function record(data)
   if state == "arm" then
-    -- first note-on starts the clock. anything before it is dropped.
     local msg = midi.to_msg(data)
     if msg.type == "note_on" and msg.vel > 0 then
       rec_start = util.time()
@@ -355,6 +333,142 @@ local function midi_event(data)
     events[#events + 1] = {t = t, data = copy}
     len = t
   end
+end
+
+local function midi_event(data)
+  local echo
+  if state == "rec" or state == "arm" then
+    echo = params:get("echo_rec") == 2
+  elseif state == "stop" then
+    echo = params:get("echo_standby") == 2
+  elseif state == "play" then
+    echo = params:get("echo_play") == 2
+  else
+    echo = false
+  end
+  if echo then send(data, "echo") end
+  record(data)
+end
+
+-- grid ----------------------------------------------------------------
+--
+-- bottom row is a control row in both modes, from the right:
+--   [cols]   menu: toggle takes <-> keyboard. always lit.
+--   [cols-1] blank
+--   [cols-2] record (K3)
+--   [cols-3] stop / play (K2)
+-- rows above it: takes mode, one cell per take, left to right then down.
+-- keyboard mode, notes in fourths: +1 per column, +5 per row going up,
+-- lowest note bottom-left. notes always sound on the out port and are
+-- recorded like midi input.
+
+local function grid_dims()
+  return g.cols or 16, g.rows or 8
+end
+
+local function grid_pos(i)
+  local cols = grid_dims()
+  return (i - 1) % cols + 1, (i - 1) // cols + 1
+end
+
+local function grid_note(x, y)
+  local _, rows = grid_dims()
+  return KEY_BASE + (x - 1) + ((rows - 1) - y) * KEY_ROW
+end
+
+local function keys_send(note, on)
+  local status = (on and 0x90 or 0x80) + KEY_CH - 1
+  local data = {status, note, on and KEY_VEL or 0}
+  send(data, "echo")
+  record(data)
+end
+
+-- several cells share a note in a fourths layout, so count holds per note
+-- and only send when the count crosses zero
+local function keys_press(note, z)
+  if note < 0 or note > 127 then return end
+  local n = keys_held[note] or 0
+  if z == 1 then
+    if n == 0 then keys_send(note, true) end
+    keys_held[note] = n + 1
+  elseif n > 0 then
+    if n == 1 then keys_send(note, false) end
+    keys_held[note] = n > 1 and n - 1 or nil
+  end
+end
+
+local function keys_release()
+  for note in pairs(keys_held) do keys_send(note, false) end
+  keys_held = {}
+end
+
+local function grid_redraw()
+  if not g or not g.device then return end
+  local cols, rows = grid_dims()
+  g:all(0)
+  local blink = math.floor(util.time() * 4) % 2 == 0
+  if grid_mode == "takes" then
+    for i = 1, math.min(#takes, cols * (rows - 1)) do
+      local x, y = grid_pos(i)
+      local lvl = 4
+      if i == queued then
+        lvl = blink and 12 or 6
+      elseif i == loaded then
+        lvl = 15
+      end
+      g:led(x, y, lvl)
+    end
+  else
+    for y = 1, rows - 1 do
+      for x = 1, cols do
+        local note = grid_note(x, y)
+        local lvl = keys_held[note] and 15 or (note % 12 == 0 and 6 or 2)
+        g:led(x, y, lvl)
+      end
+    end
+  end
+  -- control row
+  g:led(cols, rows, 15)
+  g:led(cols - 2, rows,
+    state == "rec" and 15 or (state == "arm" and (blink and 15 or 4)) or 4)
+  g:led(cols - 3, rows, state == "play" and 15 or 4)
+  g:refresh()
+end
+
+local function grid_key(x, y, z)
+  local cols, rows = grid_dims()
+  if y == rows then
+    if z ~= 1 then return end
+    if x == cols then
+      if grid_mode == "keys" then
+        keys_release()
+        grid_mode = "takes"
+      else
+        grid_mode = "keys"
+      end
+    elseif x == cols - 2 then
+      k3_press()
+    elseif x == cols - 3 then
+      k2_press()
+    end
+    redraw()
+    return
+  end
+  if grid_mode == "keys" then
+    keys_press(grid_note(x, y), z)
+    return
+  end
+  if z ~= 1 then return end
+  local i = (y - 1) * cols + x
+  if state == "stop" and takes[i] then
+    -- from stop, a grid press is "play this one", not just "select it"
+    load_take(i)
+    take_sel = i
+    start_play()
+  else
+    select_take(i)
+  end
+  redraw()
 end
 
 -- lifecycle -----------------------------------------------------------
@@ -412,6 +526,7 @@ function cleanup()
   if screen_metro then screen_metro:stop() end
   if g then
     g.key = nil
+    keys_release()
     if g.device then g:all(0); g:refresh() end
   end
   if midi_in then midi_in.event = nil end
@@ -422,21 +537,9 @@ end
 function key(n, z)
   if z == 0 then return end
   if n == 2 then
-    if state == "play" then
-      stop()
-    elseif state == "rec" or state == "arm" then
-      stop()
-      save_take()
-    else
-      start_play()
-    end
+    k2_press()
   elseif n == 3 then
-    if state == "rec" or state == "arm" then
-      stop()
-      save_take()
-    else
-      start_rec()
-    end
+    k3_press()
   end
   redraw()
 end
