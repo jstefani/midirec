@@ -14,7 +14,13 @@
 -- clock (PARAMETERS > CLOCK sets
 -- source + tempo). 4/4 assumed.
 --
+-- play mode multi: grid presses
+-- layer takes, press again to
+-- stop one. single: one take,
+-- next is queued for the bar.
+--
 -- params: in/out port, loop,
+-- play mode single / multi,
 -- rec on first note,
 -- length / launch / play quantize,
 -- follow transport,
@@ -55,16 +61,21 @@ local state = "stop" -- "stop" | "arm" | "rec" | "play"
 -- without any clock parsing here.
 local BEATS_PER_BAR = 4   -- 4/4 assumed for now
 
-local events = {}    -- {t = beats from take start, data = {bytes...}} raw, as played
-local play_events = {} -- what playback reads: events with play quantize applied
-local len = 0        -- take length in beats
+-- the focused take: what the screen, E1/E2/K2 and save work on
+local events = {}    -- raw {t = beats from take start, data = {bytes...}}
+local len = 0        -- length in beats
+local play_pos = 0   -- where K2 starts it from; mirrors its player while playing
+
+-- every playing take is a player. play mode "multi" lets several run at
+-- once, each on its own clock coroutine; "single" keeps one and swaps it
+-- at the pass boundary via `queued`.
+--   take     index in takes
+--   events   raw copy read from disk; pe = play-quantized copy playback reads
+--   len, pos, idx, t0 (global beat that maps to take beat 0)
+--   clock    coroutine id; pending = waiting on launch quantize
+local players = {}
 
 local rec_start = 0  -- beat the current recording started (may be snapped)
-local play_pos = 0   -- beats into the take
-local play_t0 = 0    -- global beat that maps to take beat 0 while playing
-local play_idx = 1
-local play_clock
-local launch_pending = false -- play pressed, waiting for the quantize boundary
 local screen_metro
 
 local takes = {}     -- list of filenames in DATA_DIR
@@ -73,12 +84,13 @@ local dirty = false  -- unsaved recording
 local rec_name       -- filename the current recording will save as
 local loaded         -- index in takes of the take held in events, if any
 local queued         -- take index to switch to when the current pass ends
-local read_take      -- forward decl, defined under files
+local read_take      -- forward decls, defined under files
+local load_file
 
--- held notes per source, [src][ch][note] = true. "play" is the take,
--- "echo" is live input passed through. tracked separately so the loop-wrap
--- panic releases only playback notes and leaves a held echo note alone.
-local notes_on = {play = {}, echo = {}}
+-- held notes per source, [src][ch][note] = true. src is "echo" for live
+-- input passed through, or a player table for that player's notes. tracked
+-- separately so stopping or wrapping one take releases only its own notes.
+local notes_on = {echo = {}}
 local last_out = -1  -- util.time() of last outgoing message
 
 -- helpers -------------------------------------------------------------
@@ -114,12 +126,12 @@ end
 -- cc, bend, pressure are left alone. a note pushed past the loop end wraps
 -- to the start of the pass.
 local PLAY_QUANT = {nil, 1, 1 / 2, 1 / 4, 1 / 8} -- off, 1/4, 1/8, 1/16, 1/32
-local function rebuild_play()
+local function derive(events, len)
   local q = PLAY_QUANT[params:get("play_quant")]
-  play_events = {}
+  local out = {}
   if not q or len <= 0 then
-    for i, e in ipairs(events) do play_events[i] = e end
-    return
+    for i, e in ipairs(events) do out[i] = e end
+    return out
   end
   local shift = {} -- [ch*128+note] = offset applied to the pending note-on
   for i, e in ipairs(events) do
@@ -138,14 +150,15 @@ local function rebuild_play()
         end
       end
     end
-    play_events[#play_events + 1] = {t = t % len, data = e.data, i = i}
+    out[#out + 1] = {t = t % len, data = e.data, i = i}
   end
   -- table.sort is not stable: break ties on recorded order so a note-off
   -- and the next note-on of the same pitch at one grid point keep their order
-  table.sort(play_events, function(a, b)
+  table.sort(out, function(a, b)
     if a.t == b.t then return a.i < b.i end
     return a.t < b.t
   end)
+  return out
 end
 
 local function scan_takes()
@@ -210,6 +223,10 @@ local function send(data, src)
   local msg = midi.to_msg(data)
   if msg.ch then
     local held = notes_on[src]
+    if not held then
+      held = {}
+      notes_on[src] = held
+    end
     if msg.type == "note_on" and msg.vel > 0 then
       held[msg.ch] = held[msg.ch] or {}
       held[msg.ch][msg.note] = true
@@ -221,33 +238,169 @@ end
 
 -- release held notes for one source, or every source when src is nil
 local function all_notes_off(src)
-  local srcs = src and {src} or {"play", "echo"}
-  for _, s in ipairs(srcs) do
-    for ch, notes in pairs(notes_on[s]) do
-      for note, _ in pairs(notes) do
-        if midi_out then midi_out:note_off(note, 0, ch) end
+  local srcs = {}
+  if src then
+    srcs[1] = src
+  else
+    for k in pairs(notes_on) do srcs[#srcs + 1] = k end
+  end
+  for _, k in ipairs(srcs) do
+    local held = notes_on[k]
+    if held then
+      for ch, notes in pairs(held) do
+        for note, _ in pairs(notes) do
+          if midi_out then midi_out:note_off(note, 0, ch) end
+        end
       end
     end
-    notes_on[s] = {}
+    -- echo lives forever; a player's table goes when the player does
+    notes_on[k] = k == "echo" and {} or nil
   end
 end
 
 -- transport -----------------------------------------------------------
 
+-- state is "rec"/"arm" while recording, else follows the player list
+local function update_state()
+  if state == "rec" or state == "arm" then return end
+  state = #players > 0 and "play" or "stop"
+end
+
+local function player_for(i)
+  for _, p in ipairs(players) do
+    if p.take == i then return p end
+  end
+end
+
+local function any_pending()
+  for _, p in ipairs(players) do
+    if p.pending then return true end
+  end
+  return false
+end
+
+-- the player the screen follows: the focused take's if playing, else the
+-- first one started
+local function focus_player()
+  return (loaded and player_for(loaded)) or players[1]
+end
+
+local function player_seek(p, pos)
+  p.pos = util.clamp(pos, 0, p.len)
+  p.idx = 1
+  while p.idx <= #p.pe and p.pe[p.idx].t < p.pos do
+    p.idx = p.idx + 1
+  end
+  p.t0 = clock.get_beats() - p.pos
+end
+
+local function player_remove(p)
+  if p.clock then
+    clock.cancel(p.clock)
+    p.clock = nil
+  end
+  all_notes_off(p)
+  for k, v in ipairs(players) do
+    if v == p then
+      table.remove(players, k)
+      break
+    end
+  end
+  update_state()
+end
+
+local function stop_players()
+  while #players > 0 do player_remove(players[#players]) end
+end
+
+-- start take i from `pos` beats. immediate skips launch quantize (an
+-- external transport start is already on the boundary). one player per
+-- take: a take already playing is left alone.
+local function player_start(i, pos, immediate)
+  if player_for(i) then return end
+  local e, l = load_file(i)
+  if not e or #e == 0 or l <= 0 then return end
+  local p = {take = i, events = e, len = l, pos = pos or 0, idx = 1, t0 = 0,
+    pending = false}
+  p.pe = derive(e, l)
+  players[#players + 1] = p
+  update_state()
+  p.clock = clock.run(function()
+    local q = (not immediate) and quant("launch_quant")
+    if q then
+      -- clock.sync waits for the next multiple of q on the global beat
+      -- grid, so every take launches on the same grid
+      p.pending = true
+      clock.sync(q)
+      p.pending = false
+    end
+    player_seek(p, p.pos)
+    while true do
+      clock.sleep(1 / 200)
+      p.pos = clock.get_beats() - p.t0
+      while p.idx <= #p.pe and p.pe[p.idx].t <= p.pos do
+        send(p.pe[p.idx].data, p)
+        p.idx = p.idx + 1
+      end
+      if p.pos >= p.len then
+        -- wrap by advancing the origin by exactly len rather than resetting
+        -- to "now", so the few ms this poll overshot do not accumulate and
+        -- the take stays locked to the beat grid pass after pass
+        if queued and p.take == loaded then
+          -- single mode, E1 turned during play: swap takes here at the
+          -- pass boundary, loop or not. an empty or unreadable take stops.
+          local qi = queued
+          queued = nil
+          all_notes_off(p)
+          local e2, l2 = load_file(qi)
+          if e2 and #e2 > 0 and l2 > 0 then
+            local old = p.len
+            p.take, p.events, p.len = qi, e2, l2
+            p.pe = derive(e2, l2)
+            p.t0 = p.t0 + old
+            p.pos = clock.get_beats() - p.t0
+            p.idx = 1
+            read_take(qi) -- focus follows
+          else
+            p.clock = nil
+            player_remove(p)
+            return
+          end
+        elseif params:get("loop") == 2 then
+          all_notes_off(p)
+          p.t0 = p.t0 + p.len
+          p.pos = clock.get_beats() - p.t0
+          p.idx = 1
+        else
+          p.clock = nil
+          player_remove(p)
+          return
+        end
+      end
+    end
+  end)
+  return p
+end
+
+-- play quantize changed: re-derive every player in place, re-finding the
+-- index from the current position so nothing double-fires
+local function rebuild_players()
+  for _, p in ipairs(players) do
+    p.pe = derive(p.events, p.len)
+    if not p.pending then player_seek(p, p.pos) end
+  end
+end
+
+-- stop everything: all players, and the recording if one is running
 local function stop()
   local pending = queued
   queued = nil
-  launch_pending = false
-  if play_clock then
-    clock.cancel(play_clock)
-    play_clock = nil
-  end
+  stop_players()
   if state == "rec" then
     local raw = math.max(0, clock.get_beats() - rec_start)
     -- length quantize rounds to the nearest beat/bar, min one unit, so a
     -- stop pressed a hair late does not add a whole extra bar. events past
-    -- the new end are the tail of that overshoot; drop them. the loop-wrap
-    -- panic covers any note-off that went with them.
+    -- the new end are the tail of that overshoot; drop them.
     local q = quant("len_quant")
     len = q and math.max(q, round_to(raw, q)) or raw
     if q then
@@ -256,14 +409,10 @@ local function stop()
       end
     end
     dirty = #events > 0
-    rebuild_play()
   elseif state == "arm" then
     len = 0
     dirty = false
   end
-  -- only the take's notes. a note held on the live input keeps sounding
-  -- until the player lets go of it.
-  all_notes_off("play")
   state = "stop"
   -- stopped with a take queued: load it now so the header and events agree
   if pending then read_take(pending) end
@@ -272,7 +421,6 @@ end
 local function start_rec()
   stop()
   events = {}
-  play_events = {}
   len = 0
   play_pos = 0
   -- snap the start to the nearest launch-quantize boundary. pressed just
@@ -284,75 +432,18 @@ local function start_rec()
   state = params:get("rec_on_note") == 2 and "arm" or "rec"
 end
 
+-- move the focused take. while it plays, its player follows.
 local function seek(pos)
   play_pos = util.clamp(pos, 0, len)
-  play_idx = 1
-  while play_idx <= #play_events and play_events[play_idx].t < play_pos do
-    play_idx = play_idx + 1
-  end
-  if state == "play" then play_t0 = clock.get_beats() - play_pos end
+  local p = loaded and player_for(loaded)
+  if p then player_seek(p, play_pos) end
 end
 
--- immediate skips launch quantize (transport start from an external clock
--- is already on the boundary)
+-- K2 play: the focused take from play_pos
 local function start_play(immediate)
-  if #events == 0 then return end
-  stop()
+  if not loaded or #events == 0 then return end
   if play_pos >= len then play_pos = 0 end
-  seek(play_pos)
-  state = "play"
-  play_clock = clock.run(function()
-    local q = (not immediate) and quant("launch_quant")
-    if q then
-      -- clock.sync waits for the next multiple of q on the global beat
-      -- grid, so every take launches on the same grid
-      launch_pending = true
-      clock.sync(q)
-      launch_pending = false
-    end
-    play_t0 = clock.get_beats() - play_pos
-    while true do
-      clock.sleep(1 / 200)
-      play_pos = clock.get_beats() - play_t0
-      while play_idx <= #play_events and play_events[play_idx].t <= play_pos do
-        send(play_events[play_idx].data, "play")
-        play_idx = play_idx + 1
-      end
-      if play_pos >= len then
-        -- wrap by advancing the origin by exactly len rather than resetting
-        -- to "now", so the few ms this poll overshot do not accumulate and
-        -- the take stays locked to the beat grid pass after pass
-        if queued then
-          -- E1 turned during play: switch takes here, at the pass boundary,
-          -- whether or not loop is on. an empty or unreadable take stops.
-          local q = queued
-          queued = nil
-          all_notes_off("play")
-          local old_len = len
-          if read_take(q) and #events > 0 then
-            play_t0 = play_t0 + old_len
-            play_pos = clock.get_beats() - play_t0
-            play_idx = 1
-          else
-            state = "stop"
-            play_clock = nil
-            return
-          end
-        elseif params:get("loop") == 2 then
-          all_notes_off("play")
-          play_t0 = play_t0 + len
-          play_pos = clock.get_beats() - play_t0
-          play_idx = 1
-        else
-          play_pos = len
-          all_notes_off("play")
-          state = "stop"
-          play_clock = nil
-          return
-        end
-      end
-    end
-  end)
+  player_start(loaded, play_pos, immediate)
 end
 
 -- files ---------------------------------------------------------------
@@ -374,23 +465,28 @@ local function save_take()
   end
 end
 
--- read take i into events without touching transport. returns true on success.
-read_take = function(i)
-  if not takes[i] then return false end
+-- read take i from disk. returns events, len  or nil.
+load_file = function(i)
+  if not takes[i] then return nil end
   local e, l = recfile.read(DATA_DIR .. takes[i])
-  if e then
-    events = e
-    len = l
-    rebuild_play()
-    play_pos = 0
-    play_idx = 1
-    dirty = false
-    loaded = i
-    print("midirec: loaded " .. takes[i] .. " (" .. #events .. " events)")
-    return true
+  if not e then
+    print("midirec: load failed - " .. tostring(l))
+    return nil
   end
-  print("midirec: load failed - " .. tostring(l))
-  return false
+  return e, l
+end
+
+-- make take i the focused take without touching transport
+read_take = function(i)
+  local e, l = load_file(i)
+  if not e then return false end
+  events = e
+  len = l
+  play_pos = 0
+  dirty = false
+  loaded = i
+  print("midirec: loaded " .. takes[i] .. " (" .. #events .. " events)")
+  return true
 end
 
 local function load_take(i)
@@ -399,15 +495,19 @@ local function load_take(i)
   read_take(i)
 end
 
--- pick take i from E1 or the grid. during play this queues it for the end
--- of the current pass rather than interrupting; picking the take that is
--- already playing cancels the queue. while recording it is ignored.
+-- E1 (and the grid in single mode). while recording it is ignored. while
+-- playing: single mode queues the take for the pass boundary, picking the
+-- playing take cancels the queue; multi mode just moves focus.
 local function select_take(i)
   if not takes[i] then return end
   if state == "rec" or state == "arm" then return end
   take_sel = i
   if state == "play" then
-    queued = i ~= loaded and i or nil
+    if params:get("play_mode") == 1 then
+      queued = i ~= loaded and i or nil
+    else
+      read_take(i)
+    end
   else
     load_take(i)
   end
@@ -606,11 +706,14 @@ local function grid_redraw()
       -- 8 is half bright on varibright and the lowest level a monobright
       -- grid shows as on, so one value covers both
       local lvl = 8
+      local p = player_for(i)
       if i == queued then
         lvl = blink and 12 or 6
+      elseif p then
+        -- waiting on launch quantize: fast; playing: slow
+        if p.pending then lvl = blink and 15 or 6 else lvl = slow and 15 or 6 end
       elseif i == loaded then
-        -- steady when loaded but stopped, slow flash while playing
-        lvl = (state == "play" and not slow) and 6 or 15
+        lvl = 15
       end
       g:led(x, y, lvl)
     end
@@ -706,8 +809,22 @@ local function grid_key(x, y, z)
   end
   if z ~= 1 then return end
   local i = (y - 1) * cols + x
-  if state == "stop" and takes[i] then
-    -- from stop, a grid press is "play this one", not just "select it"
+  if not takes[i] then return end
+  if state == "rec" or state == "arm" then return end
+  if params:get("play_mode") == 2 then
+    -- multi: each press toggles that take. launch quantize applies, so
+    -- with it on new takes fall in on the grid; off, they run free and
+    -- phase against whatever else is going. focus follows the press.
+    local p = player_for(i)
+    if p then
+      player_remove(p)
+    else
+      read_take(i)
+      take_sel = i
+      player_start(i, 0)
+    end
+  elseif state == "stop" then
+    -- single, from stop: a grid press is "play this one"
     load_take(i)
     take_sel = i
     start_play()
@@ -745,6 +862,12 @@ function init()
   end)
 
   params:add_option("loop", "loop", {"off", "on"}, 1)
+  -- single: one take plays, E1/grid queue the next for the pass boundary.
+  -- multi: grid presses layer takes, any number at once.
+  params:add_option("play_mode", "play mode", {"single", "multi"}, 2)
+  params:set_action("play_mode", function(v)
+    if v == 1 and #players > 1 then stop() end
+  end)
   params:add_option("rec_on_note", "rec on first note", {"off", "on"}, 1)
 
   params:add_separator("time")
@@ -755,10 +878,7 @@ function init()
     {"off", "1/4", "1/8", "1/16", "1/32"}, 1)
   -- re-derive the playback table in place. mid-pass the index is re-found
   -- from the current position so nothing double-fires.
-  params:set_action("play_quant", function()
-    rebuild_play()
-    if state == "play" then seek(play_pos) end
-  end)
+  params:set_action("play_quant", function() rebuild_players() end)
   -- with an external clock source, its start plays the loaded take from 0
   -- and its stop stops playback
   params:add_option("follow", "follow transport", {"off", "on"}, 2)
@@ -787,7 +907,7 @@ function init()
   -- external transport (midi / link start & stop). norns resets its beat
   -- count on start, so playing from 0 right now is on the grid already.
   clock.transport.start = function()
-    if params:get("follow") == 2 and state == "stop" and #events > 0 then
+    if params:get("follow") == 2 and state == "stop" and loaded then
       play_pos = 0
       start_play(true)
     end
@@ -841,7 +961,8 @@ function enc(n, d)
     end
   elseif n == 2 then
     if state ~= "rec" and state ~= "arm" and len > 0 then
-      seek(play_pos + d) -- one beat per click
+      local p = loaded and player_for(loaded)
+      seek((p and p.pos or play_pos) + d) -- one beat per click
     end
   elseif n == 3 then
     if d ~= 0 then
@@ -887,7 +1008,7 @@ function redraw()
     screen.level(math.floor(util.time() * 2) % 2 == 0 and 15 or 6)
     screen.text("● ARM")
     screen.level(15)
-  elseif state == "play" and launch_pending then
+  elseif state == "play" and any_pending() then
     screen.level(math.floor(util.time() * 4) % 2 == 0 and 15 or 6)
     screen.text("▶ WAIT")
     screen.level(15)
@@ -909,23 +1030,27 @@ function redraw()
     screen.text("■ STOP")
   end
 
-  -- time
+  -- time: the focused take's player if it is playing, else the first
+  -- player, else the focused take at rest
+  local fp = focus_player()
+  local pos, plen = play_pos, len
+  if fp then pos, plen = fp.pos, fp.len end
   screen.move(128, 30)
   if state == "rec" then
     screen.text_right(fmt_pos(clock.get_beats() - rec_start))
   elseif state == "arm" then
     screen.text_right(fmt_pos(0))
   else
-    screen.text_right(fmt_pos(play_pos) .. " / " .. fmt_len(len))
+    screen.text_right(fmt_pos(pos) .. " / " .. fmt_len(plen))
   end
 
   -- position bar
   screen.level(3)
   screen.rect(0.5, 38.5, 127, 5)
   screen.stroke()
-  if len > 0 then
+  if plen > 0 then
     screen.level(state == "rec" and 15 or 10)
-    local w = (state == "rec" and 1 or util.clamp(play_pos / len, 0, 1)) * 125
+    local w = (state == "rec" and 1 or util.clamp(pos / plen, 0, 1)) * 125
     screen.rect(1.5, 39.5, math.max(1, w), 3)
     screen.fill()
   end
@@ -936,7 +1061,9 @@ function redraw()
   -- shows in the SELECT menu.
   screen.level(4)
   screen.move(0, 54)
-  screen.text(#events .. " ev" .. (dirty and " *" or ""))
+  local info = #events .. " ev" .. (dirty and " *" or "")
+  if #players > 1 then info = info .. "  " .. #players .. " playing" end
+  screen.text(info)
 
   local looping = params:get("loop") == 2
   screen.level(looping and 15 or 3)
