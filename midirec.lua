@@ -6,9 +6,11 @@
 -- K3 record / stop
 -- E2 scrub (not rec)
 -- E3 loop on / off
--- grid: takes, or keyboard.
+-- grid: takes, keyboard, or a
+-- 16th-step editor (E2 note, E3
+-- gate, hold step + midi = note).
 -- bottom row: scale oct- oct+ hold
---   ... stop rec loop menu
+--   ... stop rec edit menu
 --
 -- time is in beats from the norns
 -- clock (PARAMETERS > CLOCK sets
@@ -38,9 +40,20 @@ local DATA_DIR = _path.data .. "midirec/"
 local midi_in
 local midi_out
 local g              -- grid, if one is attached
-local grid_mode = "takes" -- "takes" | "keys"
+local grid_mode = "takes" -- "takes" | "keys" | "edit"
 local keys_held = {}      -- [note] = number of grid cells holding it
 local hold_on = false     -- keyboard hold: notes latch until pressed again
+-- step editor (grid_mode "edit"): xox-style lane editor on the focused take
+local STEP = 1 / 4        -- beats per step: a 16th
+local GATES = {0.25, 0.5, 0.75, 1, 2, 3, 4}          -- note length in steps
+local GATE_NAMES = {"25%", "50%", "75%", "100%", "2 st", "3 st", "4 st"}
+local ed_note = 60        -- lane shown / placed. E2, or a midi note while a step is held
+local ed_gate = 4         -- index into GATES. E3
+local ed_page = 1
+local ed_held = {}        -- [step] = true while that grid key is down
+local ed_key_down = false -- editor key held: with a step press it sets length
+local ed_key_used = false
+local ed_midi_note        -- forward decl: editor hook for incoming note-ons
 local flash_until = {}    -- [key] = time; momentary led feedback for taps
 local FLASH = 0.15        -- seconds a tapped control key stays lit
 local scale_down = false  -- scale key held; with a note press it sets the root
@@ -601,15 +614,19 @@ local function midi_event(data)
   end
   if echo then send(data, "echo") end
   record(data)
+  if ed_midi_note then ed_midi_note(data) end
 end
 
 -- grid ----------------------------------------------------------------
 --
 -- bottom row is a control row in both modes, from the right:
 --   [cols]   menu: toggle takes <-> keyboard. always lit.
---   [cols-1] loop on / off (E3)
+--   [cols-1] step editor: tap opens / closes. held + a step sets length
 --   [cols-2] record (K3)
 --   [cols-3] stop / play (K2)
+-- editor mode: steps (16ths) left to right, top down; [1]/[2] page.
+--   press toggles the E2 note at that step with the E3 gate. hold a step
+--   and play a midi note to put that note there (and select its lane).
 -- keyboard mode only, from the left:
 --   [1] tap: next scale. hold + press a note: set root to that pitch
 --   [2] octave down   [3] octave up   [4] hold (latch) on / off
@@ -719,6 +736,184 @@ local function shift_octave(d)
   if b >= 0 and b <= 127 then params:set("grid_base", b) end
 end
 
+-- step editor -----------------------------------------------------------
+--
+-- one lane at a time, like an 808: E2 picks the note, the grid shows that
+-- note's steps bright and any other note's steps dim. a press toggles the
+-- lane note at that step with the E3 gate. hold a step and play a midi
+-- note to put that note there and make it the lane. hold the editor key
+-- and press a step to set the pattern length. edits go straight into the
+-- focused take, into its player if it is playing, and to its file.
+
+local function is_on(m) return m.type == "note_on" and m.vel > 0 end
+local function is_off(m)
+  return m.type == "note_off" or (m.type == "note_on" and m.vel == 0)
+end
+local function ev_step(t) return math.floor(t / STEP + 0.5) + 1 end
+local function ed_steps() return math.max(1, math.ceil(len / STEP - 1e-6)) end
+local function ed_cells()
+  local cols, rows = grid_dims()
+  return cols * (rows - 1), cols
+end
+local function ed_pages()
+  return math.max(1, math.ceil(ed_steps() / ed_cells()))
+end
+
+-- save the focused take to its own file. a take that has no file yet
+-- (fresh pattern) gets one via save_take.
+local function write_take()
+  if not loaded or not takes[loaded] then
+    save_take()
+    return
+  end
+  local ok, err = recfile.write(DATA_DIR .. takes[loaded], events, len,
+    clock.get_tempo())
+  if ok then dirty = false else print("midirec: write failed - " .. tostring(err)) end
+end
+
+-- after an edit: persist, and hand the player the new events in place
+local function ed_commit()
+  write_take()
+  local p = loaded and player_for(loaded)
+  if p then
+    p.events, p.len = events, len
+    p.pe = derive(events, len)
+    p.idx = 1
+    while p.idx <= #p.pe and p.pe[p.idx].t < p.pos do p.idx = p.idx + 1 end
+  end
+end
+
+-- insert keeping time order. note-offs go before anything already at that
+-- time, note-ons after, so an off landing on the next on of the same pitch
+-- does not kill it.
+local function ed_insert(t, data, before)
+  local k = #events + 1
+  for i = 1, #events do
+    if (before and events[i].t >= t) or (not before and events[i].t > t) then
+      k = i
+      break
+    end
+  end
+  table.insert(events, k, {t = t, data = data})
+end
+
+-- remove `note` at step s: its note-on(s) and each one's matching note-off
+local function ed_remove(s, note)
+  local removed = false
+  local i = 1
+  while i <= #events do
+    local m = midi.to_msg(events[i].data)
+    if m and m.ch and is_on(m) and m.note == note and ev_step(events[i].t) == s then
+      table.remove(events, i)
+      removed = true
+      for j = i, #events do
+        local m2 = midi.to_msg(events[j].data)
+        if m2 and m2.ch == m.ch and m2.note == note and is_off(m2) then
+          table.remove(events, j)
+          break
+        end
+      end
+    else
+      i = i + 1
+    end
+  end
+  return removed
+end
+
+local function ed_add(s, note)
+  local ch, vel = params:get("grid_ch"), params:get("grid_vel")
+  local t = (s - 1) * STEP
+  local off = math.min(t + GATES[ed_gate] * STEP, len - 0.001)
+  ed_insert(t, {0x90 + ch - 1, note, vel}, false)
+  ed_insert(off, {0x80 + ch - 1, note, 0}, true)
+end
+
+local function ed_toggle(s)
+  if s > ed_steps() then return end
+  if not ed_remove(s, ed_note) then ed_add(s, ed_note) end
+  ed_commit()
+end
+
+local function ed_set_len(s)
+  len = s * STEP
+  while #events > 0 and events[#events].t >= len do events[#events] = nil end
+  ed_commit()
+end
+
+local function ed_enter()
+  grid_mode = "edit"
+  ed_page = 1
+  ed_held = {}
+  -- a fresh pattern: one bar of nothing to draw into
+  if len <= 0 then
+    events = {}
+    len = BEATS_PER_BAR
+  end
+end
+
+-- a midi note-on while a step is held replaces the lane note on that step
+-- and becomes the lane
+ed_midi_note = function(data)
+  if grid_mode ~= "edit" then return end
+  local m = midi.to_msg(data)
+  if not (m and m.ch and is_on(m)) then return end
+  local any = false
+  for s in pairs(ed_held) do
+    ed_remove(s, ed_note)
+    ed_remove(s, m.note)
+    ed_add(s, m.note)
+    any = true
+  end
+  if any then
+    ed_note = m.note
+    ed_commit()
+  end
+end
+
+local function ed_key(x, y, z)
+  local cells, cols = ed_cells()
+  local s = (ed_page - 1) * cells + (y - 1) * cols + x
+  if z == 1 then
+    if ed_key_down then
+      ed_key_used = true
+      ed_set_len(s)
+      return
+    end
+    ed_held[s] = true
+    ed_toggle(s)
+  else
+    ed_held[s] = nil
+  end
+end
+
+local function ed_redraw(cols, rows)
+  local cells = cols * (rows - 1)
+  local n = ed_steps()
+  local pages = ed_pages()
+  ed_page = util.clamp(ed_page, 1, pages)
+  local lane, other = {}, {}
+  for _, e in ipairs(events) do
+    local m = midi.to_msg(e.data)
+    if m and m.ch and is_on(m) then
+      local st = ev_step(e.t)
+      if m.note == ed_note then lane[st] = true else other[st] = true end
+    end
+  end
+  local fp = loaded and player_for(loaded)
+  local ph = fp and (math.floor(fp.pos / STEP) + 1)
+  local base = (ed_page - 1) * cells
+  for c = 1, cells do
+    local st = base + c
+    if st > n then break end
+    local x, y = (c - 1) % cols + 1, (c - 1) // cols + 1
+    -- lane 15, playhead 8 (both show on monobright), other notes 4, empty 2
+    local lvl = lane[st] and 15 or (st == ph and 8) or (other[st] and 4) or 2
+    g:led(x, y, lvl)
+  end
+  g:led(1, rows, ed_page > 1 and 8 or 0)
+  g:led(2, rows, ed_page < pages and 8 or 0)
+end
+
 local function grid_redraw()
   if not g or not g.device then return end
   local cols, rows = grid_dims()
@@ -745,6 +940,8 @@ local function grid_redraw()
       end
       g:led(x, y, lvl)
     end
+  elseif grid_mode == "edit" then
+    ed_redraw(cols, rows)
   else
     local root = params:get("grid_base") % 12
     for y = 1, rows - 1 do
@@ -771,13 +968,7 @@ local function grid_redraw()
   g:led(cols - 2, rows,
     state == "rec" and 15 or (state == "arm" and (blink and 15 or 8)) or 8)
   g:led(cols - 3, rows, state == "play" and 15 or 8)
-  -- loop key: shows on/off in takes mode. on the keyboard page it stays
-  -- dark and only flashes on a tap, so the row reads as controls, not state
-  if grid_mode == "keys" then
-    g:led(cols - 1, rows, flashing("loop") and 15 or 0)
-  else
-    g:led(cols - 1, rows, params:get("loop") == 2 and 15 or 4)
-  end
+  g:led(cols - 1, rows, grid_mode == "edit" and 15 or 8) -- editor
   g:refresh()
 end
 
@@ -785,6 +976,34 @@ local function grid_key(x, y, z)
   local cols, rows = grid_dims()
   if y == rows then
     local keys = grid_mode == "keys"
+    -- editor key: tap toggles the editor; held with a step it sets length
+    if x == cols - 1 then
+      if z == 1 then
+        ed_key_down, ed_key_used = true, false
+      else
+        ed_key_down = false
+        if not ed_key_used then
+          if grid_mode == "edit" then
+            grid_mode = "takes"
+          else
+            keys_release()
+            hold_on = false
+            ed_enter()
+          end
+        end
+      end
+      return
+    end
+    if grid_mode == "edit" then
+      if z ~= 1 then return end
+      if x == 1 then
+        ed_page = math.max(1, ed_page - 1)
+        return
+      elseif x == 2 then
+        ed_page = math.min(ed_pages(), ed_page + 1)
+        return
+      end
+    end
     -- momentary keyboard controls need the release too
     if keys and x == 1 then
       if z == 1 then
@@ -808,13 +1027,12 @@ local function grid_key(x, y, z)
     if keys and x == 4 then
       hold_on = not hold_on
       if not hold_on then keys_release() end
-    elseif x == cols - 1 then
-      flash("loop")
-      params:set("loop", params:get("loop") == 2 and 1 or 2)
     elseif x == cols then
       if grid_mode == "keys" then
         keys_release()
         hold_on = false
+        grid_mode = "takes"
+      elseif grid_mode == "edit" then
         grid_mode = "takes"
       else
         grid_mode = "keys"
@@ -825,6 +1043,10 @@ local function grid_key(x, y, z)
       k2_press()
     end
     redraw()
+    return
+  end
+  if grid_mode == "edit" then
+    ed_key(x, y, z)
     return
   end
   if grid_mode == "keys" then
@@ -996,6 +1218,13 @@ function enc(n, d)
       local new = util.clamp(take_sel + d, 1, #takes)
       if new ~= take_sel then select_take(new) end
     end
+  elseif grid_mode == "edit" then
+    -- editor: E2 lane note, E3 gate
+    if n == 2 then
+      ed_note = util.clamp(ed_note + d, 0, 127)
+    elseif n == 3 then
+      ed_gate = util.clamp(ed_gate + d, 1, #GATES)
+    end
   elseif n == 2 then
     if state ~= "rec" and state ~= "arm" and len > 0 then
       local p = loaded and player_for(loaded)
@@ -1020,7 +1249,12 @@ function redraw()
   -- row 2: grid keyboard scale left, tempo + clock source right
   screen.level(4)
   screen.move(0, 18)
-  screen.text(scale_label())
+  if grid_mode == "edit" then
+    screen.text(string.format("edit %s %d",
+      musicutil.note_num_to_name(ed_note, true), ed_note))
+  else
+    screen.text(scale_label())
+  end
   screen.move(128, 18)
   -- %d needs an integer in lua 5.3; a float here blanks the whole screen
   screen.text_right(string.format("%d %s", math.floor(clock.get_tempo() + 0.5),
@@ -1098,14 +1332,21 @@ function redraw()
   -- shows in the SELECT menu.
   screen.level(4)
   screen.move(0, 54)
-  local info = #events .. " ev" .. (dirty and " *" or "")
-  if #players > 1 then info = info .. "  " .. #players .. " playing" end
-  screen.text(info)
+  if grid_mode == "edit" then
+    screen.text("gate " .. GATE_NAMES[ed_gate])
+    screen.move(128, 54)
+    screen.text_right(string.format("pg %d/%d  %d st", ed_page, ed_pages(),
+      ed_steps()))
+  else
+    local info = #events .. " ev" .. (dirty and " *" or "")
+    if #players > 1 then info = info .. "  " .. #players .. " playing" end
+    screen.text(info)
 
-  local looping = params:get("loop") == 2
-  screen.level(looping and 15 or 3)
-  screen.move(128, 54)
-  screen.text_right(looping and "LOOP" or "loop")
+    local looping = params:get("loop") == 2
+    screen.level(looping and 15 or 3)
+    screen.move(128, 54)
+    screen.text_right(looping and "LOOP" or "loop")
+  end
 
   screen.update()
 end
